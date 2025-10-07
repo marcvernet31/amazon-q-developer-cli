@@ -29,6 +29,7 @@ pub struct TangentArgs {
 pub enum TangentSubcommand {
     /// Exit tangent mode and keep the last conversation entry (user question + assistant response)
     Tail,
+    Compact,
 }
 
 impl TangentArgs {
@@ -47,7 +48,7 @@ impl TangentArgs {
         }
     }
 
-    pub async fn execute(self, os: &Os, session: &mut ChatSession) -> Result<ChatState, ChatError> {
+    pub async fn execute(self, os: &mut Os, session: &mut ChatSession) -> Result<ChatState, ChatError> {
         // Check if tangent mode is enabled
         if !ExperimentManager::is_enabled(os, ExperimentName::TangentMode) {
             execute!(
@@ -94,6 +95,38 @@ impl TangentArgs {
                         session.stderr,
                         style::SetForegroundColor(Color::Red),
                         style::Print("You need to be in tangent mode to use tail.\n"),
+                        style::SetForegroundColor(Color::Reset)
+                    )?;
+                }
+            },
+            Some(TangentSubcommand::Compact) => {
+                if ExperimentManager::is_enabled(os, ExperimentName::Checkpoint) {
+                    execute!(
+                        session.stderr,
+                        style::SetForegroundColor(Color::Yellow),
+                        style::Print(
+                            "⚠️ Checkpoint is disabled while in tangent mode. Please exit tangent mode if you want to use checkpoint.\n"
+                        ),
+                        style::SetForegroundColor(Color::Reset),
+                    )?;
+                }
+                if session.conversation.is_in_tangent_mode() {
+                    let duration_seconds = session.conversation.get_tangent_duration_seconds().unwrap_or(0);
+                    let summary = session.compact_tangent_conversation(os).await.unwrap();
+                    session.conversation.exit_tangent_mode_with_compact(summary);
+                    Self::send_tangent_telemetry(os, session, duration_seconds).await;
+
+                    execute!(
+                        session.stderr,
+                        style::SetForegroundColor(Color::Green),
+                        style::Print("✔ Tangent conversation compacted and summarized!\n"),
+                        style::SetForegroundColor(Color::Reset)
+                    )?;
+                } else {
+                    execute!(
+                        session.stderr,
+                        style::SetForegroundColor(Color::Red),
+                        style::Print("You need to be in tangent mode to use /tangent compact.\n"),
                         style::SetForegroundColor(Color::Reset)
                     )?;
                 }

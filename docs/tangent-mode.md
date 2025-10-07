@@ -39,6 +39,13 @@ Use `/tangent tail` to preserve the last conversation entry (question + answer):
 Restored conversation from checkpoint (↯) with last conversation entry preserved.
 ```
 
+### Exit Tangent Mode with Compact
+Use `/tangent compact` to summarize the tangent conversation into the main conversation:
+```
+↯ > /tangent compact
+Restored conversation from checkpoint (↯) with last tangent conversation summarized.
+```
+
 ## Usage Examples
 
 ### Example 1: Exploring Alternatives

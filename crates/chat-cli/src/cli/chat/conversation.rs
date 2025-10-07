@@ -235,6 +235,11 @@ impl ConversationState {
         self.tangent_state.is_some()
     }
 
+    // Get the length of current tangent conversation
+    pub fn get_tangent_conversation_length(&self) -> usize {
+        self.history.len() - self.tangent_state.as_ref().unwrap().main_history.len()
+    }
+
     /// Create a checkpoint of current conversation state
     fn create_checkpoint(&self) -> ConversationCheckpoint {
         ConversationCheckpoint {
@@ -299,6 +304,27 @@ impl ConversationState {
             if let Some(entry) = last_entry {
                 self.history.push_back(entry);
             }
+        }
+    }
+
+    // Exit tangent mode and summarize the tanget conversation
+    pub fn exit_tangent_mode_with_compact(&mut self, summary: String) {
+        if let Some(checkpoint) = self.tangent_state.take() {
+            debug!("Exiting tangent mode with compact. Summary length: {}", summary.len());
+
+            // Restore from checkpoint
+            self.restore_from_checkpoint(checkpoint);
+
+            // Add summary as a history entry
+            let summary_entry = HistoryEntry {
+                user: UserMessage::new_prompt(
+                    "[TANGENT SUMMARY] Please summarize what we discussed in the tangent conversation.".to_string(),
+                    None,
+                ),
+                assistant: AssistantMessage::new_response(None, format!("[TANGENT SUMMARY] {}", summary.clone())),
+                request_metadata: None,
+            };
+            self.history.push_back(summary_entry);
         }
     }
 
@@ -615,6 +641,31 @@ impl ConversationState {
             tools: &self.tools,
             model_id: self.model_info.as_ref().map(|m| m.model_id.as_str()),
         })
+    }
+
+    // Returns a [FigConversationState] with a summary of the conversation on the current tangent
+    pub async fn create_tangent_summary_request(
+        &mut self,
+        os: &Os,
+        custom_prompt: Option<impl AsRef<str>>,
+        strategy: CompactStrategy,
+    ) -> Result<FigConversationState, ChatError> {
+        if let Some(checkpoint) = &self.tangent_state {
+            let original_history = self.history.clone();
+            let tangent_history: VecDeque<_> = original_history
+                .iter()
+                .skip(checkpoint.main_history.len())
+                .cloned()
+                .collect();
+
+            self.history = tangent_history;
+            let result = self.create_summary_request(os, custom_prompt, strategy).await;
+            self.history = original_history;
+
+            result
+        } else {
+            Err(ChatError::Custom("Conversation not in tangent mode".into()))
+        }
     }
 
     /// Returns a [FigConversationState] capable of replacing the history of the current
@@ -1704,6 +1755,63 @@ mod tests {
             panic!("Expected history entry at the end");
         }
     }
+
+    #[tokio::test]
+    async fn test_tangent_mode_with_compact() {
+        let mut os = Os::new().await.unwrap();
+        let agents = Agents::default();
+        let mut tool_manager = ToolManager::default();
+        let mut conversation = ConversationState::new(
+            "test_conv_id",
+            agents,
+            tool_manager.load_tools(&mut os, &mut vec![]).await.unwrap(),
+            tool_manager,
+            None,
+            &os,
+            false,
+        )
+        .await;
+
+        // Add main conversation
+        conversation.set_next_user_message("main question".to_string()).await;
+        conversation.push_assistant_message(
+            &mut os,
+            AssistantMessage::new_response(None, "main response".to_string()),
+            None,
+        );
+
+        let main_history_len = conversation.history.len();
+
+        // Enter tangent mode
+        conversation.enter_tangent_mode();
+        assert!(conversation.is_in_tangent_mode());
+
+        // Add tangent conversation
+        conversation.set_next_user_message("tangent question".to_string()).await;
+        conversation.push_assistant_message(
+            &mut os,
+            AssistantMessage::new_response(None, "tangent response".to_string()),
+            None,
+        );
+
+        // Exit tangent mode with compact
+        let summary = "This is a summary of the tangent conversation";
+        conversation.exit_tangent_mode_with_compact(summary.to_string());
+        assert!(!conversation.is_in_tangent_mode());
+
+        // Should have main conversation + summary entry
+        assert_eq!(conversation.history.len(), main_history_len + 1);
+
+        // Check that the last message is the summary entry
+        if let Some(entry) = conversation.history.back() {
+            assert!(entry.user.prompt().unwrap().contains("[TANGENT SUMMARY]"));
+            assert!(entry.assistant.content().contains("[TANGENT SUMMARY]"));
+            assert!(entry.assistant.content().contains(summary));
+        } else {
+            panic!("Expected history entry at the end");
+        }
+    }
+
 
     #[tokio::test]
     async fn test_tangent_mode_with_tail_edge_cases() {

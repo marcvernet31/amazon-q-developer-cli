@@ -13,6 +13,7 @@ mod prompt;
 mod prompt_parser;
 pub mod server_messenger;
 use crate::cli::chat::checkpoint::CHECKPOINT_MESSAGE_MAX_LENGTH;
+use crate::cli::chat::consts::MAX_USER_MESSAGE_SIZE;
 use crate::constants::ui_text::{
     LIMIT_REACHED_TEXT,
     POPULAR_SHORTCUTS,
@@ -1607,6 +1608,85 @@ impl ChatSession {
             })
         }
     }
+
+        pub async fn compact_tangent_conversation(&mut self, os: &mut Os) -> Result<String, ChatError> {
+        // Extract only the tangent portion of the conversation
+        // let tangent_entries_count = self.conversation.history().len() - checkpoint.main_history.len();
+        let tangent_entries_count = self.conversation.get_tangent_conversation_length();
+
+        if tangent_entries_count == 0 {
+            execute!(
+                self.stderr,
+                style::SetForegroundColor(Color::Yellow),
+                style::Print("\nConversation too short to compact.\n\n"),
+                style::SetForegroundColor(Color::Reset)
+            )?;
+            return Ok("No tangent conversation to summarize".to_string());
+        }
+
+        let summarization_custom_prompt = "Summarize this tangent conversation focusing on key topics discussed and tools used. Keep it concise but capture the main insights. Create a structured summary document that will be referenced in future conversation context.";
+
+        let strategy = CompactStrategy {
+            messages_to_exclude: 0,
+            truncate_large_messages: false,
+            max_message_length: MAX_USER_MESSAGE_SIZE,
+        };
+
+        let summary_state: api_client::model::ConversationState = self
+            .conversation
+            .create_tangent_summary_request(os, Some(summarization_custom_prompt), strategy)
+            .await?;
+
+        if self.interactive {
+            execute!(self.stderr, cursor::Hide, style::Print("\n"))?;
+            self.spinner = Some(Spinner::new(
+                Spinners::Dots,
+                "Summarizing tangent conversation...".to_string(),
+            ));
+        }
+
+        let request_metadata: Arc<Mutex<Option<RequestMetadata>>> = Arc::new(Mutex::new(None));
+        let mut response = self
+            .send_message(
+                os,
+                summary_state,
+                request_metadata.clone(),
+                Some(vec![MessageMetaTag::Compact]),
+            )
+            .await?;
+
+        // Process response
+        let summary = loop {
+            match response.recv().await {
+                Some(Ok(parser::ResponseEvent::EndStream {
+                    message,
+                    request_metadata: _,
+                })) => {
+                    break message.content().to_string();
+                },
+                Some(Ok(_)) => (),
+                Some(Err(err)) => {
+                    return Err(err.into());
+                },
+                None => {
+                    return Err(ChatError::Custom("Stream failed during tangent compaction".into()));
+                },
+            }
+        };
+
+        if self.spinner.is_some() {
+            drop(self.spinner.take());
+            queue!(
+                self.stderr,
+                terminal::Clear(terminal::ClearType::CurrentLine),
+                cursor::MoveToColumn(0),
+                cursor::Show
+            )?;
+        }
+
+        Ok(summary)
+    }
+
 
     /// Generates a custom agent configuration (system prompt and tool config) based on user input.
     /// Uses an LLM to create the agent specifications from the provided name and description.
