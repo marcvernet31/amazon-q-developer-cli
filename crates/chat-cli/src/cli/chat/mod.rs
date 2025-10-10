@@ -9,6 +9,7 @@ use std::path::MAIN_SEPARATOR;
 pub mod checkpoint;
 mod line_tracker;
 mod parser;
+mod performance;
 mod prompt;
 mod prompt_parser;
 pub mod server_messenger;
@@ -300,11 +301,11 @@ impl ChatArgs {
 
             os.telemetry
                 .send_agent_config_init(&os.database, conversation_id.clone(), AgentConfigInitArgs {
-                    agents_loaded_count: md.load_count as i64,
-                    agents_loaded_failed_count: md.load_failed_count as i64,
-                    legacy_profile_migration_executed: md.migration_performed,
-                    legacy_profile_migrated_count: md.migrated_count as i64,
-                    launched_agent: md.launched_agent,
+                        agents_loaded_count: md.load_count as i64,
+                        agents_loaded_failed_count: md.load_failed_count as i64,
+                        legacy_profile_migration_executed: md.migration_performed,
+                        legacy_profile_migrated_count: md.migrated_count as i64,
+                        launched_agent: md.launched_agent,
                 })
                 .await
                 .map_err(|err| error!(?err, "failed to send agent config init telemetry"))
@@ -1609,7 +1610,7 @@ impl ChatSession {
         }
     }
 
-        pub async fn compact_tangent_conversation(&mut self, os: &mut Os) -> Result<String, ChatError> {
+    pub async fn compact_tangent_conversation(&mut self, os: &mut Os) -> Result<String, ChatError> {
         // Extract only the tangent portion of the conversation
         // let tangent_entries_count = self.conversation.history().len() - checkpoint.main_history.len();
         let tangent_entries_count = self.conversation.get_tangent_conversation_length();
@@ -3064,6 +3065,18 @@ impl ChatSession {
             self.send_chat_telemetry(os, TelemetryResult::Succeeded, None, None, None, true)
                 .await;
 
+            // Display performance metrics if verbose mode is enabled
+            let should_show_metrics = self.should_show_performance_metrics();
+            if should_show_metrics {
+                // Display metrics for the most recent request
+                if let Some(latest_metadata) = self.user_turn_request_metadata.last().cloned() {
+                    if let Err(e) = self.display_performance_metrics(&latest_metadata).await {
+                        // Log error but don't fail the conversation
+                        error!(?e, "Failed to display performance metrics");
+                    }
+                }
+            }
+
             // Run Stop hooks when the assistant finishes responding
             if let Some(cm) = self.conversation.context_manager.as_mut() {
                 let _ = cm
@@ -3434,6 +3447,81 @@ impl ChatSession {
         self.conversation.agents.trust_all_tools
     }
 
+    /// Check if performance metrics should be displayed based on verbose flag
+    fn should_show_performance_metrics(&self) -> bool {
+        self.get_verbose_level() > 0
+    }
+
+    /// Get the current verbose level from CLI args or environment variables
+    fn get_verbose_level(&self) -> u8 {
+        // First check environment variable Q_VERBOSE_LEVEL for testing/override
+        if let Ok(env_verbose) = std::env::var("Q_VERBOSE_LEVEL") {
+            if let Ok(level) = env_verbose.parse::<u8>() {
+                return level;
+            }
+        }
+
+        // Parse command line arguments to find verbose flags
+        let args: Vec<String> = std::env::args().collect();
+        let mut verbose_count = 0u8;
+
+        for arg in &args {
+            if arg == "-v" || arg == "--verbose" {
+                verbose_count = verbose_count.saturating_add(1);
+            } else if let Some(v_count) = arg.strip_prefix("-v") {
+                // Handle -vv, -vvv, etc.
+                if v_count.chars().all(|c| c == 'v') {
+                    verbose_count = verbose_count.saturating_add(v_count.len() as u8 + 1);
+                }
+            }
+        }
+
+        verbose_count
+    }
+
+    /// Display performance metrics to stderr with visual distinction
+    async fn display_performance_metrics(&mut self, metadata: &RequestMetadata) -> Result<(), ChatError> {
+        use crate::cli::chat::performance::PerformanceMetrics;
+
+        if let Some(metrics) = PerformanceMetrics::calculate(metadata) {
+            // Always use comprehensive format when verbose is enabled
+            let formatted_metrics = metrics.format_comprehensive();
+
+            // Display comprehensive metrics with visual distinction on stderr
+            execute!(
+                self.stderr,
+                style::SetForegroundColor(Color::DarkGrey),
+                style::Print("┌─ Performance Metrics "),
+                style::Print("─".repeat(40)),
+                style::Print("┐\n"),
+                style::SetAttribute(Attribute::Italic)
+            )?;
+
+            // Split multi-line output and format each line
+            for line in formatted_metrics.lines() {
+                execute!(
+                    self.stderr,
+                    style::SetForegroundColor(Color::DarkGrey),
+                    style::Print("│ "),
+                    style::Print(line),
+                    style::Print("\n")
+                )?;
+            }
+
+            execute!(
+                self.stderr,
+                style::SetForegroundColor(Color::DarkGrey),
+                style::Print("└"),
+                style::Print("─".repeat(63)),
+                style::Print("┘\n"),
+                style::SetAttribute(Attribute::Reset),
+                style::SetForegroundColor(Color::Reset)
+            )?;
+        }
+
+        Ok(())
+    }
+
     /// Display character limit warnings based on current conversation size
     async fn display_char_warnings(&mut self, os: &Os) -> Result<(), ChatError> {
         let warning_level = self.conversation.get_token_warning_level(os).await?;
@@ -3540,24 +3628,24 @@ impl ChatSession {
 
             os.telemetry
                 .send_record_user_turn_completion(&os.database, conversation_id, result, RecordUserTurnCompletionArgs {
-                    message_ids: mds.iter().map(|md| md.message_id.clone()).collect::<_>(),
-                    request_ids: mds.iter().map(|md| md.request_id.clone()).collect::<_>(),
-                    reason,
-                    reason_desc,
-                    status_code,
-                    time_to_first_chunks_ms: mds
-                        .iter()
-                        .map(|md| md.time_to_first_chunk.map(|d| d.as_secs_f64() * 1000.0))
-                        .collect::<_>(),
-                    chat_conversation_type: md.and_then(|md| md.chat_conversation_type),
-                    assistant_response_length: mds.iter().map(|md| md.response_size as i64).sum(),
-                    message_meta_tags: mds.last().map(|md| md.message_meta_tags.clone()).unwrap_or_default(),
-                    user_prompt_length: mds.first().map(|md| md.user_prompt_length).unwrap_or_default() as i64,
-                    user_turn_duration_seconds,
-                    follow_up_count: mds
-                        .iter()
-                        .filter(|md| matches!(md.chat_conversation_type, Some(ChatConversationType::ToolUse)))
-                        .count() as i64,
+                        message_ids: mds.iter().map(|md| md.message_id.clone()).collect::<_>(),
+                        request_ids: mds.iter().map(|md| md.request_id.clone()).collect::<_>(),
+                        reason,
+                        reason_desc,
+                        status_code,
+                        time_to_first_chunks_ms: mds
+                            .iter()
+                            .map(|md| md.time_to_first_chunk.map(|d| d.as_secs_f64() * 1000.0))
+                            .collect::<_>(),
+                        chat_conversation_type: md.and_then(|md| md.chat_conversation_type),
+                        assistant_response_length: mds.iter().map(|md| md.response_size as i64).sum(),
+                        message_meta_tags: mds.last().map(|md| md.message_meta_tags.clone()).unwrap_or_default(),
+                        user_prompt_length: mds.first().map(|md| md.user_prompt_length).unwrap_or_default() as i64,
+                        user_turn_duration_seconds,
+                        follow_up_count: mds
+                            .iter()
+                            .filter(|md| matches!(md.chat_conversation_type, Some(ChatConversationType::ToolUse)))
+                            .count() as i64,
                 })
                 .await
                 .ok();
@@ -4251,21 +4339,21 @@ mod tests {
         let post_hook_command = format!("cat > {}", post_hook_log_path);
 
         hooks.insert(HookTrigger::PreToolUse, vec![Hook {
-            command: pre_hook_command,
-            timeout_ms: 5000,
-            max_output_size: 1024,
-            cache_ttl_seconds: 0,
-            matcher: Some("fs_*".to_string()), // Match fs_read, fs_write, etc.
-            source: crate::cli::agent::hook::Source::Agent,
+                command: pre_hook_command,
+                timeout_ms: 5000,
+                max_output_size: 1024,
+                cache_ttl_seconds: 0,
+                matcher: Some("fs_*".to_string()), // Match fs_read, fs_write, etc.
+                source: crate::cli::agent::hook::Source::Agent,
         }]);
 
         hooks.insert(HookTrigger::PostToolUse, vec![Hook {
-            command: post_hook_command,
-            timeout_ms: 5000,
-            max_output_size: 1024,
-            cache_ttl_seconds: 0,
-            matcher: Some("fs_*".to_string()), // Match fs_read, fs_write, etc.
-            source: crate::cli::agent::hook::Source::Agent,
+                command: post_hook_command,
+                timeout_ms: 5000,
+                max_output_size: 1024,
+                cache_ttl_seconds: 0,
+                matcher: Some("fs_*".to_string()), // Match fs_read, fs_write, etc.
+                source: crate::cli::agent::hook::Source::Agent,
         }]);
 
         let agent = Agent {
@@ -4396,12 +4484,12 @@ mod tests {
         let hook_command = "echo Security policy violation: cannot read sensitive files 1>&2 & exit /b 2";
 
         hooks.insert(HookTrigger::PreToolUse, vec![Hook {
-            command: hook_command.to_string(),
-            timeout_ms: 5000,
-            max_output_size: 1024,
-            cache_ttl_seconds: 0,
-            matcher: Some("fs_read".to_string()),
-            source: crate::cli::agent::hook::Source::Agent,
+                command: hook_command.to_string(),
+                timeout_ms: 5000,
+                max_output_size: 1024,
+                cache_ttl_seconds: 0,
+                matcher: Some("fs_read".to_string()),
+                source: crate::cli::agent::hook::Source::Agent,
         }]);
 
         let agent = Agent {
@@ -4460,6 +4548,68 @@ mod tests {
         for (input, expected) in tests {
             let actual = does_input_reference_file(input).is_some();
             assert_eq!(actual, *expected, "expected {} for input {}", expected, input);
+        }
+    }
+
+    #[test]
+    fn test_verbose_level_detection() {
+        // Test environment variable override
+        unsafe {
+            std::env::set_var("Q_VERBOSE_LEVEL", "2");
+        }
+
+        // Since we can't easily create a full ChatSession in tests,
+        // let's test the verbose level detection logic directly
+        let get_verbose_level = || -> u8 {
+            // First check environment variable Q_VERBOSE_LEVEL for testing/override
+            if let Ok(env_verbose) = std::env::var("Q_VERBOSE_LEVEL") {
+                if let Ok(level) = env_verbose.parse::<u8>() {
+                    return level;
+                }
+            }
+
+            // Parse command line arguments to find verbose flags
+            let args: Vec<String> = std::env::args().collect();
+            let mut verbose_count = 0u8;
+
+            for arg in &args {
+                if arg == "-v" || arg == "--verbose" {
+                    verbose_count = verbose_count.saturating_add(1);
+                } else if let Some(v_count) = arg.strip_prefix("-v") {
+                    // Handle -vv, -vvv, etc.
+                    if v_count.chars().all(|c| c == 'v') {
+                        verbose_count = verbose_count.saturating_add(v_count.len() as u8 + 1);
+                    }
+                }
+            }
+
+            verbose_count
+        };
+
+        // Test environment variable takes precedence
+        assert_eq!(get_verbose_level(), 2);
+
+        // Clean up environment variable
+        unsafe {
+            std::env::remove_var("Q_VERBOSE_LEVEL");
+        }
+
+        // Test that should_show_performance_metrics returns true when verbose > 0
+        unsafe {
+            std::env::set_var("Q_VERBOSE_LEVEL", "1");
+        }
+        assert_eq!(get_verbose_level(), 1);
+        unsafe {
+            std::env::remove_var("Q_VERBOSE_LEVEL");
+        }
+
+        // Test that should_show_performance_metrics returns false when verbose = 0
+        unsafe {
+            std::env::set_var("Q_VERBOSE_LEVEL", "0");
+        }
+        assert_eq!(get_verbose_level(), 0);
+        unsafe {
+            std::env::remove_var("Q_VERBOSE_LEVEL");
         }
     }
 }
